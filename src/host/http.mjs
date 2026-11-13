@@ -75,6 +75,14 @@ export function registerRoutes(ctx, engine, config = {}) {
         cookieCount = undefined
       }
     }
+    let diagnostics
+    if (typeof engine.diagnose === 'function') {
+      try {
+        diagnostics = await engine.diagnose()
+      } catch (error) {
+        diagnostics = { error: errorText(error) }
+      }
+    }
     return {
       status,
       url: status.url,
@@ -83,6 +91,7 @@ export function registerRoutes(ctx, engine, config = {}) {
       canGoBack: status.canGoBack,
       canGoForward: status.canGoForward,
       cookieCount,
+      diagnostics,
       sse: {
         active: sseStats.active,
         peak: sseStats.peak,

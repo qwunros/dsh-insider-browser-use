@@ -10,7 +10,7 @@
  * counting, and events consumed by the Host SSE route.
  */
 
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,6 +23,10 @@ const DEFAULT_VIEWPORT = { width: 1280, height: 800 }
 const NAVIGATION_TIMEOUT_MS = 15_000
 const STARTUP_TIMEOUT_MS = 15_000
 const CDP_DEFAULT_TIMEOUT_MS = 30_000
+/** How long the DevTools HTTP endpoint may take to answer (attach mode). */
+const ATTACH_DISCOVERY_TIMEOUT_MS = 5000
+/** Dial `/json/version` before a browserPath search is attempted. */
+const ATTACH_PROBE_TIMEOUT_MS = 1500
 /** ~30 fps: screencast frames arriving faster than this are acked but not emitted. */
 const SCREENCAST_MIN_INTERVAL_MS = 32
 /**
@@ -33,6 +37,17 @@ const SCREENCAST_MIN_INTERVAL_MS = 32
 const SCREENCAST_MAX_WIDTH = 960
 const SCREENCAST_QUALITY = 50
 const PROFILE_LOCK_FILES = ['SingletonLock', 'SingletonCookie', 'SingletonSocket']
+
+/** Chromium-family executables this engine can drive, in preference order. */
+const BROWSER_EXE_NAMES = ['chrome.exe', 'msedge.exe', 'brave.exe', 'chromium.exe']
+
+/**
+ * DevTools ports probed automatically when no explicit attach target is
+ * configured. These are the usual suspects for "the browser the dsh panel is
+ * running in": the desktop shell, an Electron app, or a browser the user
+ * started with `--remote-debugging-port=9222`.
+ */
+const AUTODETECT_DEBUG_PORTS = [9222, 9223, 9333]
 
 /**
  * Elements the DOM snapshot exposes to the model. Kept as one selector so the
@@ -190,6 +205,113 @@ function inputCoordinate(value, max, fallback) {
 function humanButtonName(value) {
   const name = typeof value === 'string' ? value.trim().toLowerCase() : ''
   return Object.hasOwn(HUMAN_BUTTON_BITS, name) ? name : null
+}
+
+// ---------------------------------------------------------------------------
+// Browser discovery and attach-target helpers
+// ---------------------------------------------------------------------------
+
+/** Whether a hostname refers to this machine. */
+export function isLoopbackHostname(hostname) {
+  if (typeof hostname !== 'string' || hostname.length === 0) return false
+  const name = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  return name === 'localhost' || name === '::1' || name === '0.0.0.0' || /^127\./.test(name)
+}
+
+/** Map an executable path to the channel name reported in `status`. */
+export function channelForExecutable(path) {
+  const name = String(path || '').split(/[\\/]/).pop().toLowerCase()
+  if (name.startsWith('msedge')) return 'edge'
+  if (name.startsWith('brave')) return 'brave'
+  if (name.startsWith('chromium')) return 'chromium'
+  if (name.startsWith('chrome')) return 'chrome'
+  return 'system'
+}
+
+/**
+ * Resolve the "drive an existing browser instead of spawning one" setting.
+ *
+ * Accepted forms (first non-empty wins): `config.attachTo`, then
+ * `DSH_BROWSER_DEBUG_URL`, then `DSH_BROWSER_DEBUG_PORT`.
+ * - a bare port number: `9222` → `http://127.0.0.1:9222`
+ * - an http(s) URL: the DevTools HTTP endpoint (`/json/version` is read from it)
+ * - a ws(s) URL: used as the browser WebSocket directly
+ *
+ * @param {{attachTo?: unknown}} [config]
+ * @param {Record<string, string|undefined>} [env]
+ * @returns {{kind: 'http'|'ws', url: string, source: string} | null}
+ */
+export function resolveAttachTarget(config = {}, env = process.env) {
+  const options = config && typeof config === 'object' ? config : {}
+  const candidates = [
+    ['attachTo', options.attachTo],
+    ['DSH_BROWSER_DEBUG_URL', env?.DSH_BROWSER_DEBUG_URL],
+    ['DSH_BROWSER_DEBUG_PORT', env?.DSH_BROWSER_DEBUG_PORT],
+  ]
+  for (const [source, raw] of candidates) {
+    if (raw === undefined || raw === null) continue
+    const text = String(raw).trim()
+    if (text === '' || text === 'false' || text === 'off' || text === 'none') continue
+    if (/^\d+$/.test(text)) {
+      const port = Number(text)
+      if (!(port > 0 && port <= 65_535)) throw new Error(`the ${source} value ${JSON.stringify(text)} is not a valid port`)
+      return { kind: 'http', url: `http://127.0.0.1:${port}`, source }
+    }
+    if (/^wss?:\/\//i.test(text)) return { kind: 'ws', url: text, source }
+    if (/^https?:\/\//i.test(text)) return { kind: 'http', url: text.replace(/\/+$/, ''), source }
+    throw new Error(`the ${source} value ${JSON.stringify(text)} is not an http(s) URL, a ws(s) URL or a port number`)
+  }
+  return null
+}
+
+/** Look an executable up on PATH without spawning a process. */
+function findOnPath(names, env = process.env) {
+  const raw = String(env.PATH || env.Path || '')
+  if (raw === '') return []
+  const separator = process.platform === 'win32' ? ';' : ':'
+  const extensions = process.platform === 'win32' ? ['', '.exe'] : ['']
+  const found = []
+  for (const directory of raw.split(separator)) {
+    const dir = directory.trim().replace(/^"|"$/g, '')
+    if (dir === '') continue
+    for (const name of names) {
+      for (const extension of extensions) {
+        const candidate = join(dir, name + extension)
+        if (existsSync(candidate)) found.push(candidate)
+      }
+    }
+  }
+  return found
+}
+
+/** Read `App Paths` entries from the Windows registry (best effort). */
+function windowsAppPathEntries(names) {
+  if (process.platform !== 'win32') return []
+  const roots = [
+    'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths',
+    'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths',
+  ]
+  const found = []
+  for (const root of roots) {
+    for (const name of names) {
+      try {
+        const output = execFileSync('reg', ['query', `${root}\\${name}`, '/ve'], {
+          encoding: 'utf8',
+          windowsHide: true,
+          timeout: 3000,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        })
+        const match = /REG_SZ\s+([^\r\n]+)/.exec(output)
+        if (match) {
+          const value = match[1].trim().replace(/^"|"$/g, '')
+          if (value && existsSync(value)) found.push(value)
+        }
+      } catch {
+        /* not registered, or reg.exe is unavailable */
+      }
+    }
+  }
+  return found
 }
 
 /**
@@ -769,6 +891,27 @@ export class BrowserEngine {
     this._noSandbox = options.noSandbox === true
     this._startUrl = typeof options.startUrl === 'string' && options.startUrl.trim() ? options.startUrl.trim() : ''
     this._initialNavigationDone = false
+    /** Explicit attach target (config or env); when set no browser is spawned. */
+    this._attachTarget = resolveAttachTarget(options, process.env)
+    /** Try the usual DevTools ports before searching for an executable. */
+    this._autoAttach = options.autoAttach !== false
+    this._autoAttachPorts = Array.isArray(options.autoAttachPorts) && options.autoAttachPorts.length > 0
+      ? options.autoAttachPorts
+        .map((port) => clampInt(port, 1, 65_535, 0))
+        .filter((port) => port > 0)
+      : [...AUTODETECT_DEBUG_PORTS]
+    this._allowRemoteDebugging = options.allowRemoteDebugging === true
+    /**
+     * Writing cookies into a browser this plugin did not start would change the
+     * user's real cookie jar, so attaching requires an explicit opt-in.
+     */
+    this._allowCookieWrites = options.allowCookieWrites === true
+    this._carrier = 'none'
+    this._endpoint = null
+    this._lastStartError = null
+    this._candidateCache = null
+    this._diagnosticsCache = null
+    this._diagnosticsAt = 0
 
     /** @type {Map<string, Set<Function>>} */
     this._listeners = new Map()
@@ -891,6 +1034,10 @@ export class BrowserEngine {
       loading: Boolean(this._state.loading),
       canGoBack: Boolean(this._state.canGoBack),
       canGoForward: Boolean(this._state.canGoForward),
+      /** 'spawned' (own headless instance) | 'attached' (existing browser) | 'none' */
+      carrier: this._carrier,
+      ...(this._endpoint ? { endpoint: this._endpoint } : {}),
+      ...(this._lastStartError ? { lastError: this._lastStartError } : {}),
       ...(typeof this._pageVisible === 'boolean' ? { visible: this._pageVisible } : {}),
       ...(typeof this._pageFocused === 'boolean' ? { focused: this._pageFocused } : {}),
     }
@@ -955,7 +1102,20 @@ export class BrowserEngine {
         }
       }
       const cdp = this._cdp
-      if (cdp && cdp.isOpen) {
+      const attached = this._carrier === 'attached'
+      const closingTarget = this._targetId
+      if (cdp && cdp.isOpen && attached && closingTarget) {
+        // Give the carrier's tab back: close only the page this plugin opened.
+        try {
+          await Promise.race([
+            cdp.send('Target.closeTarget', { targetId: closingTarget }, undefined, 3000),
+            delay(2500),
+          ])
+        } catch {
+          /* the tab or the carrier may already be gone */
+        }
+      }
+      if (cdp && cdp.isOpen && !attached) {
         try {
           await cdp.send('Browser.close', {}, undefined, 1500)
         } catch {
@@ -964,157 +1124,400 @@ export class BrowserEngine {
       }
       if (cdp) cdp.close()
       this._cdp = null
+      this._targetId = null
       await this._killChild()
       this._running = false
+      this._carrier = 'none'
+      this._endpoint = null
       this._resetPage('browser stopped', { log: false })
       this._activityCounts.clear()
       if (this._activity.active) {
         this._activity = { active: false }
         this._emit('activity', { active: false })
       }
-      this._cleanupProfileLocks()
-      this._log('info', 'browser stopped')
+      if (!attached) this._cleanupProfileLocks()
+      this._log('info', attached ? 'released the attached browser (its tab was closed, the browser keeps running)' : 'browser stopped')
     } finally {
       this._stopping = false
       this._emit('state', this.status)
     }
   }
 
+  /**
+   * Start the browser: attach to an existing Chromium-family process when one
+   * is configured or discoverable, otherwise spawn our own headless instance.
+   */
   async _doStart() {
     this._starting = true
     this._stopping = false
+    this._lastStartError = null
     try {
-      await this._killChild()
-      const resolved = this._resolveExecutable()
-      this._executable = resolved.path
-      this._channel = resolved.channel
-      try {
-        mkdirSync(this._profileDir, { recursive: true })
-      } catch (error) {
-        throw new Error(`could not create the browser profile directory ${JSON.stringify(this._profileDir)}: ${errorMessage(error)}`)
-      }
-      try {
-        rmSync(join(this._profileDir, 'DevToolsActivePort'), { force: true })
-      } catch {
-        /* ignore */
-      }
-      const args = this._buildLaunchArgs()
-      let child
-      try {
-        child = spawn(resolved.path, args, { stdio: 'ignore', windowsHide: true })
-      } catch (error) {
-        throw new Error(`could not launch ${resolved.channel} (${resolved.path}): ${errorMessage(error)}`)
-      }
-      this._child = child
-      child.once('error', (error) => {
-        this._log('error', `browser process error: ${errorMessage(error)}`)
-      })
-      child.once('exit', (code, signal) => {
-        const wasCurrent = this._child === child
-        if (wasCurrent) this._child = null
-        if (this._stopping) return
-        this._running = false
-        if (this._cdp) {
-          const cdp = this._cdp
-          this._cdp = null
-          try {
-            cdp.close()
-          } catch {
-            /* ignore */
-          }
-        }
-        this._resetPage(`browser process exited (code ${code === null ? 'null' : code}${signal ? `, signal ${signal}` : ''})`, { log: false })
-        if (wasCurrent) this._log('warn', 'the browser process exited unexpectedly; it will be restarted on the next call')
-        this._emit('state', this.status)
-      })
-
-      const endpoint = await this._waitForDevToolsPort(STARTUP_TIMEOUT_MS)
-      const cdp = new Cdp(() => this._handleBrowserDisconnect())
-      try {
-        await cdp.connect(`ws://127.0.0.1:${endpoint.port}${endpoint.path}`, STARTUP_TIMEOUT_MS)
-      } catch (error) {
-        cdp.close()
-        await this._killChild()
-        throw new Error(`could not attach to the browser DevTools endpoint on port ${endpoint.port}: ${errorMessage(error)}`)
-      }
-      this._cdp = cdp
-      this._installBrowserEventListeners()
-      try {
-        await cdp.send('Target.setDiscoverTargets', { discover: true }, undefined, 5000)
-      } catch {
-        /* target discovery is an enhancement; tool calls still work without it */
-      }
-      try {
-        const version = await cdp.send('Browser.getVersion', {}, undefined, 10_000)
-        this._browserVersion = version || null
-        const rawUserAgent = String(version?.userAgent || '')
-        this._userAgent = rawUserAgent.replace(/HeadlessChrome/g, 'Chrome')
-      } catch {
-        this._browserVersion = null
-        this._userAgent = ''
-      }
-      this._running = true
-      this._initialNavigationDone = false
-      if (this._stopping) {
-        // stop() ran while this start was racing it: do not leave a browser behind.
-        this._running = false
-        const raceCdp = this._cdp
-        this._cdp = null
-        try {
-          raceCdp?.close()
-        } catch {
-          /* ignore */
-        }
-        await this._killChild()
-        throw new Error('browser start was cancelled by stop()')
-      }
-      this._log('info', `started ${resolved.channel} in headless mode (pid ${child.pid})`)
-      this._emit('state', this.status)
+      const attach = await this._pickAttachTarget()
+      if (attach) await this._startAttached(attach)
+      else await this._startSpawned()
+    } catch (error) {
+      this._lastStartError = errorMessage(error)
+      throw error
     } finally {
       this._starting = false
     }
   }
 
-  /** Resolve the executable and channel, preferring an explicitly configured path. */
-  _resolveExecutable() {
-    const configured = this._config && typeof this._config.browserPath === 'string' ? this._config.browserPath.trim() : ''
-    if (configured) {
-      if (!existsSync(configured)) throw new Error(`the configured browserPath does not exist: ${JSON.stringify(configured)}`)
-      const requested = typeof this._config.browserChannel === 'string' ? this._config.browserChannel.toLowerCase() : ''
-      return { path: configured, channel: requested === 'edge' ? 'edge' : requested === 'chrome' ? 'chrome' : 'system' }
-    }
-    const requested = typeof this._config.browserChannel === 'string' ? this._config.browserChannel.toLowerCase() : ''
-    const candidates = []
-    if (process.platform === 'win32') {
-      const programFiles = process.env.ProgramFiles || 'C:\\Program Files'
-      const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
-      const localAppData = process.env.LOCALAPPDATA || ''
-      const chrome = [
-        join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        ...(localAppData ? [join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe')] : []),
-      ]
-      const edge = [
-        join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-        join(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-        ...(localAppData ? [join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe')] : []),
-      ]
-      if (requested === 'edge') candidates.push(...edge.map((path) => ({ path, channel: 'edge' })))
-      else if (requested === 'chrome') candidates.push(...chrome.map((path) => ({ path, channel: 'chrome' })))
-      else candidates.push(...chrome.map((path) => ({ path, channel: 'chrome' })), ...edge.map((path) => ({ path, channel: 'edge' })))
-    } else if (process.platform === 'darwin') {
-      const chrome = ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']
-      const edge = ['/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge']
-      candidates.push(...chrome.map((path) => ({ path, channel: 'chrome' })), ...edge.map((path) => ({ path, channel: 'edge' })))
+  /**
+   * Diagnostics for "no usable browser" reports: which executables are
+   * installed, whether a configured attach target answers, and the reason the
+   * last start failed.
+   * @param {{maxAgeMs?: number}} [options] cache age for repeated `/state` polls
+   */
+  async diagnose(options = {}) {
+    const maxAge = clampInt(options.maxAgeMs, 0, 60_000, 5000)
+    const now = Date.now()
+    if (this._diagnosticsCache && now - this._diagnosticsAt < maxAge) return this._diagnosticsCache
+    const candidates = this._browserCandidates().map((candidate) => ({ ...candidate }))
+    let attach
+    if (this._attachTarget) {
+      attach = {
+        configured: true,
+        source: this._attachTarget.source,
+        endpoint: this._attachTarget.url,
+        reachable: false,
+      }
+      try {
+        const version = await this._fetchDevToolsVersion(this._attachTarget, ATTACH_PROBE_TIMEOUT_MS)
+        attach.reachable = true
+        if (typeof version?.product === 'string') attach.product = version.product
+      } catch (error) {
+        attach.error = errorMessage(error)
+      }
     } else {
-      const chrome = ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser']
-      const edge = ['/usr/bin/microsoft-edge', '/usr/bin/microsoft-edge-stable']
-      candidates.push(...chrome.map((path) => ({ path, channel: 'chrome' })), ...edge.map((path) => ({ path, channel: 'edge' })))
+      attach = {
+        configured: false,
+        autoDetect: this._autoAttach,
+        ports: this._autoAttach ? [...this._autoAttachPorts] : [],
+      }
     }
-    for (const candidate of candidates) {
-      if (existsSync(candidate.path)) return candidate
+    const result = {
+      platform: process.platform,
+      carrier: this._carrier,
+      endpoint: this._endpoint,
+      executable: this._executable,
+      channel: this._channel,
+      profileDir: this._profileDir,
+      candidates,
+      attach,
+      env: {
+        DSH_BROWSER_PATH: process.env.DSH_BROWSER_PATH || null,
+        DSH_BROWSER_DEBUG_URL: process.env.DSH_BROWSER_DEBUG_URL || null,
+        DSH_BROWSER_DEBUG_PORT: process.env.DSH_BROWSER_DEBUG_PORT || null,
+        DSH_BROWSER_CHANNEL: process.env.DSH_BROWSER_CHANNEL || null,
+      },
+      lastError: this._lastStartError,
     }
-    throw new Error('could not find a Chrome or Edge executable to drive; set the browserPath plugin option to the browser executable')
+    this._diagnosticsCache = result
+    this._diagnosticsAt = now
+    return result
+  }
+
+  /**
+   * Decide whether to drive an existing browser.
+   *
+   * An explicit target (config/env) is authoritative: if it does not answer the
+   * start fails with the real reason instead of silently spawning another
+   * browser. Without one, the usual DevTools ports are probed so that a browser
+   * the user already runs with remote debugging (or an Electron/desktop shell)
+   * is reused when available.
+   * @returns {Promise<{kind:'http'|'ws', url:string, source:string} | null>}
+   */
+  async _pickAttachTarget() {
+    if (this._attachTarget) return this._attachTarget
+    if (!this._autoAttach) return null
+    for (const port of this._autoAttachPorts) {
+      const candidate = { kind: 'http', url: `http://127.0.0.1:${port}`, source: 'auto' }
+      try {
+        await this._fetchDevToolsVersion(candidate, ATTACH_PROBE_TIMEOUT_MS)
+        return candidate
+      } catch {
+        /* nothing listening on that port */
+      }
+    }
+    return null
+  }
+
+  /** Read `<endpoint>/json/version` (with a bounded timeout). */
+  async _fetchDevToolsVersion(target, timeoutMs = ATTACH_DISCOVERY_TIMEOUT_MS) {
+    if (target.kind === 'ws') return { webSocketDebuggerUrl: target.url }
+    const url = new URL(target.url)
+    if (!isLoopbackHostname(url.hostname) && !this._allowRemoteDebugging) {
+      throw new Error(`refusing to attach to ${target.url}: only loopback DevTools endpoints are allowed unless the allowRemoteDebugging option is true`)
+    }
+    let response
+    try {
+      response = await fetch(`${target.url}/json/version`, {
+        signal: AbortSignal.timeout(timeoutMs),
+        headers: { accept: 'application/json' },
+      })
+    } catch (error) {
+      throw new Error(`no DevTools endpoint answered at ${target.url} (${errorMessage(error)}); start that browser with --remote-debugging-port=9222 or clear the attachTo option`)
+    }
+    if (!response.ok) throw new Error(`the DevTools endpoint at ${target.url} answered HTTP ${response.status}`)
+    let body
+    try {
+      body = await response.json()
+    } catch {
+      throw new Error(`the DevTools endpoint at ${target.url} did not return JSON; is it really a Chrome/Edge DevTools port?`)
+    }
+    if (!body || typeof body.webSocketDebuggerUrl !== 'string') {
+      throw new Error(`the DevTools endpoint at ${target.url} did not report a webSocketDebuggerUrl`)
+    }
+    return body
+  }
+
+  /** Attach to an existing browser and remember that we must not close it. */
+  async _startAttached(target) {
+    const version = await this._fetchDevToolsVersion(target)
+    const wsUrl = target.kind === 'ws' ? target.url : version.webSocketDebuggerUrl
+    const cdp = new Cdp(() => this._handleBrowserDisconnect())
+    try {
+      await cdp.connect(wsUrl, STARTUP_TIMEOUT_MS)
+    } catch (error) {
+      cdp.close()
+      throw new Error(`could not attach to the browser DevTools WebSocket at ${target.url}: ${errorMessage(error)}`)
+    }
+    this._cdp = cdp
+    this._carrier = 'attached'
+    this._endpoint = target.url
+    this._executable = null
+    this._channel = typeof version?.product === 'string' && version.product
+      ? String(version.product).split('/')[0].toLowerCase()
+      : 'chromium'
+    this._installBrowserEventListeners()
+    try {
+      await cdp.send('Target.setDiscoverTargets', { discover: true }, undefined, 5000)
+    } catch {
+      /* target discovery is an enhancement */
+    }
+    try {
+      const info = await cdp.send('Browser.getVersion', {}, undefined, 10_000)
+      this._browserVersion = info || version || null
+      const rawUserAgent = String(info?.userAgent || '')
+      if (rawUserAgent) this._userAgent = rawUserAgent.replace(/HeadlessChrome/g, 'Chrome')
+    } catch {
+      this._browserVersion = version || null
+    }
+    this._running = true
+    this._initialNavigationDone = false
+    if (this._stopping) {
+      this._running = false
+      const raceCdp = this._cdp
+      this._cdp = null
+      try {
+        raceCdp?.close()
+      } catch {
+        /* ignore */
+      }
+      throw new Error('browser start was cancelled by stop()')
+    }
+    this._log('info', `attached to the existing browser at ${target.url} (${this._channel}); this plugin drives a tab in it and never closes it`)
+    this._emit('state', this.status)
+  }
+
+  /** Spawn our own headless Chrome/Edge and connect to it. */
+  async _startSpawned() {
+    await this._killChild()
+    const resolved = this._resolveExecutable()
+    this._executable = resolved.path
+    this._channel = resolved.channel
+    this._carrier = 'spawned'
+    this._endpoint = null
+    try {
+      mkdirSync(this._profileDir, { recursive: true })
+    } catch (error) {
+      throw new Error(`could not create the browser profile directory ${JSON.stringify(this._profileDir)}: ${errorMessage(error)}`)
+    }
+    try {
+      rmSync(join(this._profileDir, 'DevToolsActivePort'), { force: true })
+    } catch {
+      /* ignore */
+    }
+    const args = this._buildLaunchArgs()
+    let child
+    try {
+      child = spawn(resolved.path, args, { stdio: 'ignore', windowsHide: true })
+    } catch (error) {
+      throw new Error(`could not launch ${resolved.channel} (${resolved.path}): ${errorMessage(error)}`)
+    }
+    this._child = child
+    child.once('error', (error) => {
+      this._log('error', `browser process error: ${errorMessage(error)}`)
+    })
+    child.once('exit', (code, signal) => {
+      const wasCurrent = this._child === child
+      if (wasCurrent) this._child = null
+      if (this._stopping) return
+      this._running = false
+      if (this._cdp) {
+        const cdp = this._cdp
+        this._cdp = null
+        try {
+          cdp.close()
+        } catch {
+          /* ignore */
+        }
+      }
+      this._resetPage(`browser process exited (code ${code === null ? 'null' : code}${signal ? `, signal ${signal}` : ''})`, { log: false })
+      if (wasCurrent) this._log('warn', 'the browser process exited unexpectedly; it will be restarted on the next call')
+      this._emit('state', this.status)
+    })
+
+    const endpoint = await this._waitForDevToolsPort(STARTUP_TIMEOUT_MS)
+    const cdp = new Cdp(() => this._handleBrowserDisconnect())
+    try {
+      await cdp.connect(`ws://127.0.0.1:${endpoint.port}${endpoint.path}`, STARTUP_TIMEOUT_MS)
+    } catch (error) {
+      cdp.close()
+      await this._killChild()
+      throw new Error(`could not attach to the browser DevTools endpoint on port ${endpoint.port}: ${errorMessage(error)}`)
+    }
+    this._cdp = cdp
+    this._installBrowserEventListeners()
+    try {
+      await cdp.send('Target.setDiscoverTargets', { discover: true }, undefined, 5000)
+    } catch {
+      /* target discovery is an enhancement; tool calls still work without it */
+    }
+    try {
+      const version = await cdp.send('Browser.getVersion', {}, undefined, 10_000)
+      this._browserVersion = version || null
+      const rawUserAgent = String(version?.userAgent || '')
+      this._userAgent = rawUserAgent.replace(/HeadlessChrome/g, 'Chrome')
+    } catch {
+      this._browserVersion = null
+      this._userAgent = ''
+    }
+    this._running = true
+    this._initialNavigationDone = false
+    if (this._stopping) {
+      // stop() ran while this start was racing it: do not leave a browser behind.
+      this._running = false
+      const raceCdp = this._cdp
+      this._cdp = null
+      try {
+        raceCdp?.close()
+      } catch {
+        /* ignore */
+      }
+      await this._killChild()
+      throw new Error('browser start was cancelled by stop()')
+    }
+    this._log('info', `started ${resolved.channel} in headless mode (pid ${child.pid})`)
+    this._emit('state', this.status)
+  }
+
+  /**
+   * Every Chromium-family executable this engine would consider driving.
+   *
+   * Sources, in order: the `browserPath` option, `DSH_BROWSER_PATH`, the Windows
+   * `App Paths` registry entries, the conventional install directories (stable,
+   * Beta, Dev, Canary, Chromium, Brave) and finally PATH. The result is cached
+   * because a failed start is retried on every tool call.
+   * @returns {Array<{path:string, channel:string, source:string}>}
+   */
+  _browserCandidates() {
+    if (this._candidateCache) return this._candidateCache
+    const candidates = []
+    const seen = new Set()
+    const push = (path, source) => {
+      if (typeof path !== 'string' || path === '') return
+      const key = path.toLowerCase()
+      if (seen.has(key)) return
+      if (!existsSync(path)) return
+      seen.add(key)
+      candidates.push({ path, channel: channelForExecutable(path), source })
+    }
+
+    const configured = this._config && typeof this._config.browserPath === 'string' ? this._config.browserPath.trim() : ''
+    if (configured) push(configured, 'config')
+    push(String(process.env.DSH_BROWSER_PATH || '').trim(), 'env:DSH_BROWSER_PATH')
+
+    const lookupNames = process.platform === 'win32'
+      ? BROWSER_EXE_NAMES
+      : ['google-chrome', 'google-chrome-stable', 'microsoft-edge', 'microsoft-edge-stable', 'brave-browser', 'chromium', 'chromium-browser']
+    for (const path of windowsAppPathEntries(BROWSER_EXE_NAMES)) push(path, 'registry')
+    for (const path of findOnPath(lookupNames)) push(path, 'PATH')
+
+    const add = (root, parts, source) => {
+      if (!root) return
+      push(join(root, ...parts), source)
+    }
+    if (process.platform === 'win32') {
+      const roots = [
+        process.env.ProgramFiles,
+        process.env['ProgramFiles(x86)'],
+        process.env.LOCALAPPDATA,
+        'C:\\Program Files',
+        'C:\\Program Files (x86)',
+      ].filter(Boolean)
+      for (const root of roots) {
+        add(root, ['Google', 'Chrome', 'Application', 'chrome.exe'], 'install')
+        add(root, ['Google', 'Chrome Beta', 'Application', 'chrome.exe'], 'install')
+        add(root, ['Google', 'Chrome Dev', 'Application', 'chrome.exe'], 'install')
+        add(root, ['Google', 'Chrome SxS', 'Application', 'chrome.exe'], 'install')
+        add(root, ['Microsoft', 'Edge', 'Application', 'msedge.exe'], 'install')
+        add(root, ['Microsoft', 'Edge Beta', 'Application', 'msedge.exe'], 'install')
+        add(root, ['Microsoft', 'Edge Dev', 'Application', 'msedge.exe'], 'install')
+        add(root, ['Microsoft', 'Edge SxS', 'Application', 'msedge.exe'], 'install')
+        add(root, ['BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'], 'install')
+        add(root, ['Chromium', 'Application', 'chrome.exe'], 'install')
+      }
+    } else if (process.platform === 'darwin') {
+      const roots = ['/Applications']
+      if (process.env.HOME) roots.push(join(process.env.HOME, 'Applications'))
+      for (const root of roots) {
+        if (!root) continue
+        add(root, ['Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'], 'install')
+        add(root, ['Google Chrome Beta.app', 'Contents', 'MacOS', 'Google Chrome Beta'], 'install')
+        add(root, ['Microsoft Edge.app', 'Contents', 'MacOS', 'Microsoft Edge'], 'install')
+        add(root, ['Brave Browser.app', 'Contents', 'MacOS', 'Brave Browser'], 'install')
+        add(root, ['Chromium.app', 'Contents', 'MacOS', 'Chromium'], 'install')
+      }
+    } else {
+      for (const path of [
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/microsoft-edge',
+        '/usr/bin/microsoft-edge-stable',
+        '/usr/bin/brave-browser',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/snap/bin/chromium',
+        '/snap/bin/google-chrome',
+        '/var/lib/flatpak/exports/bin/com.google.Chrome',
+        '/var/lib/flatpak/exports/bin/com.microsoft.Edge',
+      ]) push(path, 'install')
+    }
+    this._candidateCache = candidates
+    return candidates
+  }
+
+  /**
+   * Resolve the executable and channel to spawn.
+   * @returns {{path:string, channel:string, source?:string}}
+   */
+  _resolveExecutable() {
+    const requested = String(
+      (this._config && typeof this._config.browserChannel === 'string' ? this._config.browserChannel : '') ||
+      process.env.DSH_BROWSER_CHANNEL ||
+      '',
+    ).trim().toLowerCase()
+    const candidates = this._browserCandidates()
+    const matching = requested ? candidates.filter((candidate) => candidate.channel === requested) : candidates
+    const hit = matching[0]
+    if (hit) return hit
+    const probed = candidates.slice(0, 8).map((candidate) => candidate.path)
+    const hint = requested
+      ? `no ${requested} executable was found; clear the browserChannel option or install it`
+      : 'install Chrome or Edge, set the browserPath plugin option (or the DSH_BROWSER_PATH environment variable) to a Chrome/Edge/Chromium executable, or point attachTo at a browser that is already running with --remote-debugging-port'
+    throw new Error(`could not find a Chromium-based browser to drive: ${hint}${probed.length ? `; known browsers: ${probed.join(', ')}` : ''}`)
   }
 
   _buildLaunchArgs() {
@@ -1207,10 +1610,16 @@ export class BrowserEngine {
 
   _handleBrowserDisconnect() {
     if (this._stopping) return
+    const attached = this._carrier === 'attached'
     this._cdp = null
     this._running = false
     this._resetPage('the DevTools connection closed', { log: false })
-    this._log('warn', 'lost the DevTools connection to the browser; it will be restarted on the next call')
+    this._log(
+      'warn',
+      attached
+        ? 'the attached browser closed its DevTools connection; the next call will try to attach again or start a browser'
+        : 'lost the DevTools connection to the browser; it will be restarted on the next call',
+    )
     this._emit('state', this.status)
   }
 
@@ -2505,6 +2914,20 @@ export class BrowserEngine {
 
   // -- cookies --------------------------------------------------------------
 
+  /**
+   * Refuse destructive cookie writes when driving a browser that belongs to the
+   * user (attached carrier), unless the operator opted in.
+   * @param {'clear'|'write'} action
+   */
+  _assertCookieWritesAllowed(action) {
+    if (this._carrier !== 'attached' || this._allowCookieWrites === true) return
+    throw new Error(
+      `refusing to ${action} cookies in a browser this plugin did not start; ` +
+      'set the "allowCookieWrites" plugin option to true if touching its real cookie jar is intended, ' +
+      'or disable attachTo so the plugin uses its own profile',
+    )
+  }
+
   /** List all cookies held by the built-in browser profile. */
   async listCookies() {
     await this.ensure()
@@ -2535,6 +2958,7 @@ export class BrowserEngine {
 
   /** Clear every cookie in the built-in browser profile. */
   async clearCookies() {
+    this._assertCookieWritesAllowed('clear')
     await this.ensure()
     try {
       await this._sendPage('Network.clearBrowserCookies', {}, 20_000)
@@ -2555,6 +2979,7 @@ export class BrowserEngine {
    */
   async setCookies(cookies) {
     if (!Array.isArray(cookies)) throw new Error('setCookies expects an array of cookie objects')
+    this._assertCookieWritesAllowed('write')
     await this.ensure()
     let set = 0
     let failed = 0

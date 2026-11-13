@@ -9,6 +9,11 @@ import { registerRoutes } from './src/host/http.mjs'
  * driven over CDP, the model-facing `browser_*` tools, the right-sidebar SSE
  * and action routes, and the cookie settings endpoints.
  *
+ * By default it spawns its own headless browser. When `attachTo` (or the
+ * `DSH_BROWSER_DEBUG_URL` / `DSH_BROWSER_DEBUG_PORT` environment variables)
+ * names a DevTools endpoint, it instead drives a tab in that existing browser
+ * — the panel's own browser or an Electron shell — and never closes it.
+ *
  * Everything is registered as an effect so unloading the plugin closes the
  * browser and every route/subscriber with it.
  */
@@ -21,8 +26,14 @@ export function apply(ctx, config = {}) {
     profileDir: configObject.profileDir || join(home, 'insider-browser', 'profile'),
     browserPath: configObject.browserPath,
     browserChannel: configObject.browserChannel,
+    attachTo: configObject.attachTo,
+    autoAttach: configObject.autoAttach,
+    allowRemoteDebugging: configObject.allowRemoteDebugging,
+    allowCookieWrites: configObject.allowCookieWrites,
     startUrl: configObject.startUrl,
     viewport: configObject.viewport || { width: 1280, height: 800 },
+    extraArgs: configObject.extraArgs,
+    noSandbox: configObject.noSandbox,
   }, ctx.logger)
 
   ctx.effect(() => engine.on('log', (entry) => {

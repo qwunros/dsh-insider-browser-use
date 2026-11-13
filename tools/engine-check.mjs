@@ -16,9 +16,10 @@
  *     Mojo IPC channels.
  */
 
+import { createServer } from 'node:http'
 import { mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { BrowserEngine, normalizeBrowserUrl } from '../src/host/engine.mjs'
+import { BrowserEngine, normalizeBrowserUrl, resolveAttachTarget } from '../src/host/engine.mjs'
 import { registerTools } from '../src/host/tools.mjs'
 
 const cliArgs = new Set(process.argv.slice(2))
@@ -248,6 +249,7 @@ class FakeCdp {
     this.visibility = 'visible'
     this.focused = true
     this.closedTargets = []
+    this.browserCloses = 0
     this.bodyText = 'Example Domain\nThis domain is for use in illustrative examples in documents.\nMore information...'
     this.elements = [
       { ref: 1, kind: 'link', label: 'More information...', value: '', selector: 'a', x: 640, y: 320, w: 120, h: 20 },
@@ -383,6 +385,7 @@ class FakeCdp {
         return {}
       case 'Browser.close':
         this.closed = true
+        this.browserCloses += 1
         return {}
       default:
         throw new Error(`fake CDP does not implement ${method}`)
@@ -836,8 +839,109 @@ async function runMockChecks() {
 
   await engine.stop()
   check('mock: stop closes the fake page', engine.status.running === false)
+  check('mock: a spawned browser is closed on stop', fake.browserCloses === 1, `${fake.browserCloses} Browser.close`)
   const selectionAfterStop = await engine.selectionText()
   check('mock: selectionText is empty when no page is running', selectionAfterStop === '', JSON.stringify(selectionAfterStop))
+
+  // -- attach mode --------------------------------------------------------
+  check('attach: a bare port points at loopback', JSON.stringify(resolveAttachTarget({ attachTo: '9222' }, {})) === JSON.stringify({ kind: 'http', url: 'http://127.0.0.1:9222', source: 'attachTo' }), JSON.stringify(resolveAttachTarget({ attachTo: '9222' }, {})))
+  check('attach: an http endpoint is normalized', resolveAttachTarget({ attachTo: 'http://127.0.0.1:9333/' }, {}).url === 'http://127.0.0.1:9333')
+  check('attach: a ws URL is used directly', resolveAttachTarget({}, { DSH_BROWSER_DEBUG_URL: 'ws://127.0.0.1:9222/devtools/browser/x' }).kind === 'ws')
+  check('attach: the env port is honored', resolveAttachTarget({}, { DSH_BROWSER_DEBUG_PORT: '9555' }).url === 'http://127.0.0.1:9555')
+  check('attach: nothing configured means spawn', resolveAttachTarget({}, {}) === null)
+  let attachRejected = false
+  try { resolveAttachTarget({ attachTo: 'not a url' }, {}) } catch { attachRejected = true }
+  check('attach: an invalid attachTo is rejected', attachRejected)
+
+  const fakeAttached = new FakeCdp()
+  const attachedEngine = new BrowserEngine({ attachTo: 'http://127.0.0.1:9222' })
+  attachFakePage(attachedEngine, fakeAttached)
+  attachedEngine._carrier = 'attached'
+  attachedEngine._endpoint = 'http://127.0.0.1:9222'
+  check('attach: status reports the carrier and endpoint', attachedEngine.status.carrier === 'attached' && attachedEngine.status.endpoint === 'http://127.0.0.1:9222', JSON.stringify({ carrier: attachedEngine.status.carrier, endpoint: attachedEngine.status.endpoint }))
+  let cookieWriteBlocked = false
+  try { await attachedEngine.clearCookies() } catch (error) { cookieWriteBlocked = /refusing to clear cookies/.test(error.message) }
+  check('attach: cookie clears are refused by default', cookieWriteBlocked)
+  let cookieSetBlocked = false
+  try { await attachedEngine.setCookies([{ name: 'a', value: '1' }]) } catch (error) { cookieSetBlocked = /refusing to write cookies/.test(error.message) }
+  check('attach: cookie writes are refused by default', cookieSetBlocked)
+  const optedInEngine = new BrowserEngine({ attachTo: 'http://127.0.0.1:9222', allowCookieWrites: true })
+  attachFakePage(optedInEngine, new FakeCdp())
+  optedInEngine._carrier = 'attached'
+  let optedInAllowed = true
+  try { await optedInEngine.clearCookies() } catch { optedInAllowed = false }
+  check('attach: allowCookieWrites opts in to cookie writes', optedInAllowed)
+  const attachedListed = await attachedEngine.listCookies()
+  check('attach: cookie reads stay allowed', Array.isArray(attachedListed))
+  await attachedEngine.stop()
+  check('attach: stop closes only our tab', fakeAttached.closedTargets.includes('target-1') && fakeAttached.browserCloses === 0, JSON.stringify({ closed: fakeAttached.closedTargets, closes: fakeAttached.browserCloses }))
+  check('attach: stop leaves the carrier running', attachedEngine.status.running === false && attachedEngine.status.carrier === 'none')
+
+  // -- discovery ----------------------------------------------------------
+  const previousBrowserPath = process.env.DSH_BROWSER_PATH
+  process.env.DSH_BROWSER_PATH = process.execPath
+  const pathEngine = new BrowserEngine({ profileDir: join(process.cwd(), '.tmp-mock-profile') })
+  let resolvedFromEnv = null
+  try {
+    resolvedFromEnv = pathEngine._resolveExecutable()
+  } finally {
+    if (previousBrowserPath === undefined) delete process.env.DSH_BROWSER_PATH
+    else process.env.DSH_BROWSER_PATH = previousBrowserPath
+  }
+  check('discovery: DSH_BROWSER_PATH is honored', resolvedFromEnv && resolvedFromEnv.path === process.execPath, JSON.stringify(resolvedFromEnv))
+  check('discovery: candidates report their source', pathEngine._browserCandidates().every((candidate) => typeof candidate.source === 'string'))
+
+  const noAttachEngine = new BrowserEngine({ profileDir: join(process.cwd(), '.tmp-mock-profile') })
+  const noAttachDiagnostics = await noAttachEngine.diagnose({ maxAgeMs: 0 })
+  check(
+    'discovery: diagnose explains an unconfigured attach target',
+    noAttachDiagnostics.attach.configured === false && Array.isArray(noAttachDiagnostics.candidates) && typeof noAttachDiagnostics.platform === 'string',
+    JSON.stringify({ attach: noAttachDiagnostics.attach, candidates: noAttachDiagnostics.candidates.length }),
+  )
+  const unreachableEngine = new BrowserEngine({ attachTo: 'http://127.0.0.1:1', profileDir: join(process.cwd(), '.tmp-mock-profile') })
+  const unreachableDiagnostics = await unreachableEngine.diagnose({ maxAgeMs: 0 })
+  check(
+    'discovery: diagnose reports an unreachable endpoint',
+    unreachableDiagnostics.attach.configured === true && unreachableDiagnostics.attach.reachable === false && typeof unreachableDiagnostics.attach.error === 'string',
+    JSON.stringify(unreachableDiagnostics.attach),
+  )
+
+  // Auto-attach: a DevTools endpoint answering on one of the configured ports
+  // must be picked up without any attachTo option.
+  const autoPort = await new Promise((resolve) => {
+    const server = createServer((req, res) => {
+      if (req.url === '/json/version') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/browser/fake`, product: 'Fake/1' }))
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    })
+    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }))
+    server.on('error', () => resolve({ server: null, port: 0 }))
+  })
+  if (autoPort.server) {
+    try {
+      const autoEngine = new BrowserEngine({
+        profileDir: join(process.cwd(), '.tmp-mock-profile'),
+        autoAttachPorts: [autoPort.port],
+      })
+      const picked = await autoEngine._pickAttachTarget()
+      check('discovery: a listening DevTools port is auto-attached', picked && picked.url === `http://127.0.0.1:${autoPort.port}`, JSON.stringify(picked))
+
+      const offEngine = new BrowserEngine({
+        profileDir: join(process.cwd(), '.tmp-mock-profile'),
+        autoAttach: false,
+        autoAttachPorts: [autoPort.port],
+      })
+      check('discovery: autoAttach:false keeps spawning', (await offEngine._pickAttachTarget()) === null)
+    } finally {
+      autoPort.server.close()
+    }
+  } else {
+    console.log('SKIP discovery: could not bind a temporary port for the auto-attach check')
+  }
 
   // -- tools registration -------------------------------------------------
   const fake2 = new FakeCdp()

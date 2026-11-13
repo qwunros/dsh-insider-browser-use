@@ -57,6 +57,40 @@ its lifetime. The profile is persistent, so logins survive restarts.
 The plugin exposes a small CDP client (no `ws` dependency) with request/response
 matching and event subscriptions.
 
+## Browser carrier
+
+The engine has two carriers and picks one at start:
+
+1. **attached** — a Chromium-family browser that is already running with a
+   DevTools endpoint. This covers the browser that displays the panel (when it
+   was started with `--remote-debugging-port`), an Electron/desktop shell, or a
+   browser the plugin itself spawned in an earlier run.
+2. **spawned** — the plugin launches its own headless Chrome/Edge with a private
+   profile.
+
+Selection order:
+
+- `attachTo` (plugin config) or `DSH_BROWSER_DEBUG_URL` /
+  `DSH_BROWSER_DEBUG_PORT` — authoritative. If it does not answer, start fails
+  with the real reason instead of silently spawning a second browser.
+- otherwise the usual ports (`9222`, `9223`, `9333`, configurable with
+  `autoAttachPorts`) are probed; `autoAttach: false` disables this.
+- otherwise an executable is located and spawned.
+
+In attach mode the engine opens **one tab** (`Target.createTarget`) in the
+carrier's default browser context, so cookies and logins are shared, and
+remembers that it must not close the browser: `stop()` closes only that target
+and then disconnects. Destructive cookie operations are refused unless
+`allowCookieWrites: true`, and only loopback endpoints are accepted unless
+`allowRemoteDebugging: true`.
+
+Executable discovery, when spawning, checks in order: `browserPath`,
+`DSH_BROWSER_PATH`, the Windows `App Paths` registry (`chrome.exe`,
+`msedge.exe`, `brave.exe`, `chromium.exe`), PATH, and the conventional install
+directories including Chrome/Edge Beta/Dev/Canary, Chromium and Brave. Probed
+paths and the last start error are exposed through `engine.diagnose()`, which
+`GET /state` reports as `diagnostics`.
+
 ## Live mirror
 
 `Page.startScreencast` produces JPEG frames. The engine:
@@ -110,7 +144,7 @@ spellings of the same host are accepted):
 | Route | Purpose |
 | --- | --- |
 | `GET /events` | SSE: `hello`, `frame`, `navigation`, `activity`, `cursor`, `log` |
-| `GET /state` | JSON status snapshot, including `visible`/`focused` diagnostics |
+| `GET /state` | JSON status snapshot, including `visible`/`focused` and `diagnostics` (carrier, candidates, attach reachability, last start error) |
 | `POST /action` | Panel/settings actions: navigate, history, input, selection, cookies, stop |
 
 Mutations require `Content-Type: application/json`. Cookie values and page text
@@ -139,6 +173,7 @@ node tools/http-check.mjs              # HTTP/SSE surface
 node tools/client-human-check.mjs      # client input/link-navigation handlers
 node demo/server.mjs                   # optional local page on :8899
 node tools/live-check.mjs              # end-to-end against a running dsh + plugin
+node tools/attach-check.mjs            # attach mode against a real running browser
 ```
 
 `tools/engine-check.mjs` without `--mock` launches a real Chrome/Edge and
