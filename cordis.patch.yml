@@ -1,0 +1,10 @@
+# dsh-insider-browser bundle patch: mounts the built-in browser host plugin.
+#
+# The host row is the package root on purpose: the Web client module scan resolves
+# a loader row's specifier to a PACKAGE ROOT and reads `dsh.client` from there.
+# A row named after a subpath would be skipped, leaving the right-sidebar panel
+# absent even though the agent tools work. The root entry (index.mjs) is the host
+# half; client.js is the browser half resolved from package.json `dsh.client`.
+- insert:
+    - id: insider-browser
+      name: dsh-insider-browser

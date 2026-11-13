@@ -1,0 +1,55 @@
+{
+  "name": "dsh-insider-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Built-in browser for the dsh Web right sidebar, with agent-facing browser tools: CDP-driven Chrome/Edge, live view, virtual cursor, toast, content/source/screenshots, and cookie management",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "files": [
+    "index.mjs",
+    "client.js",
+    "src",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE",
+    "docs"
+  ],
+  "scripts": {
+    "test": "node tools/engine-check.mjs --mock && node tools/host-check.mjs && node tools/http-check.mjs && node tools/client-human-check.mjs",
+    "demo": "node demo/server.mjs"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "browser",
+    "cdp",
+    "plugin"
+  ],
+  "license": "MIT"
+}

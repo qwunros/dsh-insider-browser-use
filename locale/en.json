@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Built-in Browser",
+    "description": "Open a real browser in the right sidebar and let the agent drive it: live view, virtual cursor, page content/source, screenshots, and cookie management."
+  }
+}

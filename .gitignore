@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+.npm-cache/
+
+# Local reference material and development screenshots
+ref/
+shots/
+
+# Logs and temporary files
+*.log
+*.tmp
+.tmp-*/
+
+# Environment and local credentials
+.env
+.env.*
+!.env.example
+
+# OS noise
+.DS_Store
+Thumbs.db

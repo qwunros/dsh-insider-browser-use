@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>dsh 内置浏览器演示</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; display: grid; place-items: center; }
+  .card { width: min(760px, 92vw); background: #1e293b; border: 1px solid #334155; border-radius: 18px; padding: 28px; box-shadow: 0 20px 60px rgba(0,0,0,.45); }
+  h1 { margin: 0 0 8px; font-size: 26px; }
+  p { color: #94a3b8; line-height: 1.6; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+  button, input { font: inherit; padding: 10px 14px; border-radius: 10px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; }
+  button { cursor: pointer; }
+  button.primary { background: #2563eb; border-color: #3b82f6; }
+  #counter { font-weight: 700; color: #38bdf8; }
+  #greeting { margin-top: 14px; min-height: 22px; color: #4ade80; }
+  #events { margin-top: 18px; border-top: 1px solid #334155; padding-top: 12px; font: 12px/18px Consolas, monospace; color: #cbd5e1; }
+  #events b { color: #38bdf8; }
+  #selection { margin-top: 14px; padding: 10px 12px; background: #0b1220; border: 1px dashed #475569; border-radius: 8px; color: #e2e8f0; }
+</style>
+</head>
+<body>
+  <main class="card">
+    <h1>dsh 内置浏览器演示页</h1>
+    <p>用来验证右侧栏面板：实时画面、toast、光标、点击、拖拽、滚轮、键盘、输入法、选择文本与截图。</p>
+    <div class="row">
+      <button id="count" class="primary">点我 +1</button>
+      <button id="hello">打招呼</button>
+      <button id="right" title="右键我">右键我</button>
+    </div>
+    <p>点击次数：<span id="counter">0</span> · 双击次数：<span id="dbl">0</span> · 右键次数：<span id="ctx">0</span></p>
+    <div class="row">
+      <input id="name" placeholder="输入你的名字" />
+      <button id="submit">提交</button>
+      <button id="clear">清空输入</button>
+    </div>
+    <div id="greeting"></div>
+    <div id="selection">选中这段文字（用鼠标拖过它），然后按 Ctrl+C 可以测试「复制到系统剪贴板」；这段文字也是页面内选择文本。</div>
+    <div id="coords" style="font:11px Consolas,monospace;color:#64748b;margin-top:6px">selection box: -</div>
+    <div id="events">事件日志（最近 6 条）：
+      <div id="log"></div>
+    </div>
+  </main>
+  <script>
+    const logEl = document.getElementById('log')
+    const lines = []
+    function log(line) {
+      lines.push(line)
+      while (lines.length > 6) lines.shift()
+      logEl.innerHTML = lines.map((item) => '<div>' + item + '</div>').join('')
+    }
+    let bubbles = 0
+    let dbl = 0
+    let ctx = 0
+    const counter = document.getElementById('counter')
+    const greeting = document.getElementById('greeting')
+    document.getElementById('count').addEventListener('click', () => {
+      bubbles += 1
+      counter.textContent = String(bubbles)
+      log('click <b>count</b> -> ' + bubbles)
+    })
+    document.getElementById('hello').addEventListener('click', () => {
+      greeting.textContent = '你好！智能体正在操作这个页面。'
+      log('click <b>hello</b>')
+    })
+    document.getElementById('submit').addEventListener('click', () => {
+      const name = document.getElementById('name').value
+      greeting.textContent = name ? '你好，' + name + '！表单输入正常。' : '请先输入名字。'
+      log('click <b>submit</b> value=' + JSON.stringify(name))
+    })
+    document.getElementById('clear').addEventListener('click', () => {
+      document.getElementById('name').value = ''
+      greeting.textContent = ''
+      log('click <b>clear</b>')
+    })
+    document.getElementById('dbl').parentElement.addEventListener('dblclick', (event) => {
+      dbl += 1
+      document.getElementById('dbl').textContent = String(dbl)
+      log('dblclick at ' + Math.round(event.clientX) + ',' + Math.round(event.clientY))
+    })
+    document.getElementById('right').addEventListener('contextmenu', (event) => {
+      event.preventDefault()
+      ctx += 1
+      document.getElementById('ctx').textContent = String(ctx)
+      log('contextmenu (right click) ' + Math.round(event.clientX) + ',' + Math.round(event.clientY))
+    })
+    let wheelY = 0
+    window.addEventListener('wheel', (event) => {
+      wheelY += event.deltaY
+      log('wheel dy=' + Math.round(event.deltaY) + ' total=' + Math.round(wheelY) + ' scrollY=' + Math.round(window.scrollY))
+    }, { passive: true })
+    let pointerDown = 0
+    document.addEventListener('mousedown', (event) => {
+      pointerDown += 1
+      log('mousedown ' + event.button + ' @ ' + Math.round(event.clientX) + ',' + Math.round(event.clientY))
+    })
+    document.addEventListener('mouseup', (event) => {
+      log('mouseup ' + event.button + ' @ ' + Math.round(event.clientX) + ',' + Math.round(event.clientY))
+    })
+    document.addEventListener('keydown', (event) => {
+      const mods = (event.altKey ? 'A' : '') + (event.ctrlKey ? 'C' : '') + (event.metaKey ? 'M' : '') + (event.shiftKey ? 'S' : '')
+      log('keydown ' + JSON.stringify(event.key) + ' code=' + event.code + ' mods=' + (mods || '-') + ' repeat=' + event.repeat)
+    }, true)
+    document.addEventListener('keyup', (event) => {
+      log('keyup ' + JSON.stringify(event.key))
+    }, true)
+    document.getElementById('name').addEventListener('input', (event) => {
+      log('input value=' + JSON.stringify(event.target.value))
+    })
+    let lastMove = 0
+    document.addEventListener('mousemove', (event) => {
+      const now = Date.now()
+      if (now - lastMove < 200) return
+      lastMove = now
+      log('mousemove buttons=' + event.buttons + ' @ ' + Math.round(event.clientX) + ',' + Math.round(event.clientY))
+    }, true)
+    document.addEventListener('selectionchange', () => {
+      const text = String(window.getSelection()).replace(/\s+/g, ' ').slice(0, 24)
+      log('selection=' + JSON.stringify(text))
+    })
+    function showCoords() {
+      const box = document.getElementById('selection').getBoundingClientRect()
+      document.getElementById('coords').textContent =
+        'selection box: left=' + Math.round(box.left) + ' top=' + Math.round(box.top) +
+        ' width=' + Math.round(box.width) + ' height=' + Math.round(box.height) +
+        ' scrollY=' + Math.round(window.scrollY)
+    }
+    showCoords()
+    window.addEventListener('resize', showCoords)
+    window.addEventListener('scroll', showCoords, { passive: true })
+  </script>
+</body>
+</html>
